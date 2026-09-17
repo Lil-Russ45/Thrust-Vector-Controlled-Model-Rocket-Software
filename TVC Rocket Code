@@ -1,0 +1,276 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <MPU6050_tockn.h>
+
+
+MPU6050 mpu(Wire);
+Servo servoPitch;
+Servo servoYaw;
+Servo servoChute;
+
+
+// Flight Computer States
+enum FlightState {
+  STATE_PRE_LAUNCH,
+  STATE_POWERED_FLIGHT,
+  STATE_COAST,
+  STATE_APOGEE,
+  STATE_ABORT
+};
+
+
+FlightState currentState = STATE_PRE_LAUNCH;
+
+
+// Hardware Pins
+const int SERVO_PITCH_PIN = 2;
+const int SERVO_YAW_PIN   = 3;
+const int SERVO_CHUTE_PIN = 4;
+const int PCB_LED_PIN     = 1;
+const int TEENSY_LED_PIN  = 13;
+
+
+// Servo Positions
+const float PITCH_CENTER       = 104.0;
+const float YAW_CENTER         = 76.0;
+const int   CHUTE_CLOSED_POS   = 0;
+const int   CHUTE_DEPLOY_POS   = 90;
+
+
+// Deflection & Safety Limits
+const float PITCH_MAX_DEFLECTION = 8.0;
+const float YAW_MAX_DEFLECTION   = 15.0;
+const float MAX_TILT_ABORT_ANGLE = 35.0; // Angle threshold (deg) before triggering abort
+
+
+// Launch & Apogee Thresholds (IMU-based)
+const float LAUNCH_ACCEL_THRESHOLD  = 2.0;  // In Gs (Total acceleration trigger)
+const float BURNOUT_ACCEL_THRESHOLD = 0.5;  // In Gs (Motor burnout detection)
+const unsigned long LAUNCH_TIMEOUT_MS = 8000; // Hard backup limit: force parachute after 8s
+
+
+// Filter Settings
+const float EMA_ALPHA      = 0.35;
+const float MAX_SERVO_STEP = 1.0;
+
+
+// PID Gains
+float Kp_pitch = 1.00, Ki_pitch = 0.00, Kd_pitch = 0.05;
+float Kp_yaw   = 2.00, Ki_yaw   = 0.00, Kd_yaw   = 0.12;
+
+
+// Calibration & State Variables
+float pitchTare = 0.0, yawTare = 0.0;
+float pitchAngle = 0.0, yawAngle = 0.0;
+float filteredPitch = 0.0, filteredYaw = 0.0;
+
+
+float pitchErrorSum = 0.0, lastPitchError = 0.0;
+float yawErrorSum   = 0.0, lastYawError   = 0.0;
+
+
+float currentPitchCmd = PITCH_CENTER;
+float currentYawCmd   = YAW_CENTER;
+
+
+unsigned long lastTime = 0;
+unsigned long lastPrintTime = 0;
+unsigned long launchTime = 0;
+
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PCB_LED_PIN, OUTPUT);
+  pinMode(TEENSY_LED_PIN, OUTPUT);
+
+
+  digitalWrite(TEENSY_LED_PIN, HIGH);
+  digitalWrite(PCB_LED_PIN, LOW);
+
+
+  servoPitch.attach(SERVO_PITCH_PIN);
+  servoYaw.attach(SERVO_YAW_PIN);
+  servoChute.attach(SERVO_CHUTE_PIN);
+
+
+  servoPitch.write(PITCH_CENTER);
+  servoYaw.write(YAW_CENTER);
+  servoChute.write(CHUTE_CLOSED_POS);
+
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+
+  mpu.begin();
+  mpu.calcGyroOffsets(true);
+
+
+  // Calibration loop
+  float rawPitchSum = 0.0, rawYawSum = 0.0;
+  for (int i = 0; i < 50; i++) {
+    mpu.update();
+    float ax = mpu.getAccX();
+    float ay = mpu.getAccY();
+    float az = mpu.getAccZ();
+
+
+    rawPitchSum += atan2(ax, az) * 57.2958;
+    rawYawSum   += atan2(ay, az) * 57.2958;
+    delay(10);
+  }
+  pitchTare = rawPitchSum / 50.0;
+  yawTare   = rawYawSum / 50.0;
+
+
+  digitalWrite(PCB_LED_PIN, HIGH);
+  lastTime = micros();
+}
+
+
+void loop() {
+  mpu.update();
+
+
+  unsigned long currentTime = micros();
+  if (currentTime - lastTime < 10000) return; // 100 Hz Loop
+
+
+  float dt = (currentTime - lastTime) / 1000000.0;
+  lastTime = currentTime;
+
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+
+  // Total magnitude of acceleration vector (in Gs)
+  float accelMagnitude = sqrt((ax * ax) + (ay * ay) + (az * az));
+
+
+  // Angles relative to tare baseline
+  float rawPitch = (atan2(ax, az) * 57.2958) - pitchTare;
+  float rawYaw   = (atan2(ay, az) * 57.2958) - yawTare;
+
+
+  // Complementary & EMA Filters
+  pitchAngle = 0.95 * (pitchAngle + mpu.getGyroY() * dt) + 0.05 * rawPitch;
+  yawAngle   = 0.95 * (yawAngle   + mpu.getGyroX() * dt) + 0.05 * rawYaw;
+
+
+  filteredPitch = (EMA_ALPHA * pitchAngle) + ((1.0 - EMA_ALPHA) * filteredPitch);
+  filteredYaw   = (EMA_ALPHA * yawAngle)   + ((1.0 - EMA_ALPHA) * filteredYaw);
+
+
+  // ==========================================
+  // FLIGHT STATE MACHINE
+  // ==========================================
+  switch (currentState) {
+
+
+    case STATE_PRE_LAUNCH:
+      // Detect liftoff via strong positive acceleration
+      if (accelMagnitude > LAUNCH_ACCEL_THRESHOLD) {
+        currentState = STATE_POWERED_FLIGHT;
+        launchTime = millis();
+        Serial.println(">>> LAUNCH DETECTED <<<");
+      }
+      break;
+
+
+    case STATE_POWERED_FLIGHT:
+      // Abort condition: Check for extreme tilt angle
+      if (abs(filteredPitch) > MAX_TILT_ABORT_ANGLE || abs(filteredYaw) > MAX_TILT_ABORT_ANGLE) {
+        currentState = STATE_ABORT;
+        Serial.println(">>> ABORT TRIGGERED: EXCESSIVE TILT <<<");
+        break;
+      }
+
+
+      // Transition to Coast when motor thrust cuts out (burnout)
+      if (accelMagnitude < BURNOUT_ACCEL_THRESHOLD) {
+        currentState = STATE_COAST;
+        Serial.println(">>> MOTOR BURNOUT / COAST DETECTED <<<");
+      }
+      break;
+
+
+    case STATE_COAST:
+      // In coast, if acceleration drops near zero (freefall at apogee) OR backup timer expires
+      if (accelMagnitude < 0.25 || (millis() - launchTime) > LAUNCH_TIMEOUT_MS) {
+        currentState = STATE_APOGEE;
+      }
+      break;
+
+
+    case STATE_APOGEE:
+      // Deploy Parachute
+      servoChute.write(CHUTE_DEPLOY_POS);
+      
+      // Center TVC Servos to protect gimbal mechanism on landing
+      currentPitchCmd = PITCH_CENTER;
+      currentYawCmd   = YAW_CENTER;
+      break;
+
+
+    case STATE_ABORT:
+      // Immediate action: Deploy parachute and neutralize TVC
+      servoChute.write(CHUTE_DEPLOY_POS);
+      currentPitchCmd = PITCH_CENTER;
+      currentYawCmd   = YAW_CENTER;
+      
+      // Flash PCB LED rapidly to signal abort mode
+      digitalWrite(PCB_LED_PIN, (millis() / 100) % 2);
+      break;
+  }
+
+
+  // ==========================================
+  // TVC PID CONTROL (Active during Powered Flight)
+  // ==========================================
+  if (currentState == STATE_POWERED_FLIGHT) {
+    // Pitch PID
+    float pitchError = 0.0 - filteredPitch;
+    pitchErrorSum = constrain(pitchErrorSum + (pitchError * dt), -10.0, 10.0);
+    float pitchDerivative = (pitchError - lastPitchError) / dt;
+    lastPitchError = pitchError;
+    float pitchOutput = (Kp_pitch * pitchError) + (Ki_pitch * pitchErrorSum) + (Kd_pitch * pitchDerivative);
+
+
+    // Yaw PID
+    float yawError = 0.0 - filteredYaw;
+    yawErrorSum = constrain(yawErrorSum + (yawError * dt), -10.0, 10.0);
+    float yawDerivative = (yawError - lastYawError) / dt;
+    lastYawError = yawError;
+    float yawOutput = (Kp_yaw * yawError) + (Ki_yaw * yawErrorSum) + (Kd_yaw * yawDerivative);
+
+
+    // Target Clamping
+    float targetPitchCmd = constrain(PITCH_CENTER + pitchOutput, PITCH_CENTER - PITCH_MAX_DEFLECTION, PITCH_CENTER + PITCH_MAX_DEFLECTION);
+    float targetYawCmd   = constrain(YAW_CENTER   + yawOutput,   YAW_CENTER   - YAW_MAX_DEFLECTION,   YAW_CENTER   + YAW_MAX_DEFLECTION);
+
+
+    // Slew Limiting
+    currentPitchCmd += constrain(targetPitchCmd - currentPitchCmd, -MAX_SERVO_STEP, MAX_SERVO_STEP);
+    currentYawCmd   += constrain(targetYawCmd   - currentYawCmd,   -MAX_SERVO_STEP, MAX_SERVO_STEP);
+  } else if (currentState == STATE_PRE_LAUNCH) {
+    currentPitchCmd = PITCH_CENTER;
+    currentYawCmd   = YAW_CENTER;
+  }
+
+
+  servoPitch.write(currentPitchCmd);
+  servoYaw.write(currentYawCmd);
+
+
+  // Serial Monitoring (Every 200ms)
+  if (millis() - lastPrintTime > 200) {
+    lastPrintTime = millis();
+    Serial.print("State: "); Serial.print(currentState);
+    Serial.print(" | Pitch: "); Serial.print(filteredPitch, 1);
+    Serial.print("° | Yaw: "); Serial.print(filteredYaw, 1);
+    Serial.print("° | Accel G: "); Serial.println(accelMagnitude, 2);
+  }
+}
+
