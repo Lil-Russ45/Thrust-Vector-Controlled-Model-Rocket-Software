@@ -1,0 +1,216 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <MPU6050_tockn.h>
+
+
+MPU6050 mpu(Wire);
+Servo servoPitch;
+Servo servoYaw;
+Servo servoChute;
+
+
+// Hardware Pins
+const int SERVO_PITCH_PIN = 4;
+const int SERVO_YAW_PIN   = 3;
+const int SERVO_CHUTE_PIN = 2;
+const int PCB_LED_PIN     = 1;
+const int TEENSY_LED_PIN  = 13;
+
+
+// Servo Positions
+const float PITCH_CENTER     = 76.0;
+const float YAW_CENTER       = 99.0;
+const int   CHUTE_CLOSED_POS = 0;
+const int   CHUTE_DEPLOY_POS = 55;
+
+
+// Deflection Limits
+const float PITCH_MAX_DEFLECTION = 10.0;
+const float YAW_MAX_DEFLECTION   = 15.0;
+
+
+// Launch Threshold
+const float LAUNCH_ACCEL_THRESHOLD = 2.0; // Acceleration trigger in Gs
+
+
+// Filter Settings
+const float EMA_ALPHA      = 0.1;
+const float MAX_SERVO_STEP = 1.0;
+
+
+// PID Gains
+float Kp_pitch = 0.3, Ki_pitch = 0.00, Kd_pitch = 0.05;
+float Kp_yaw   = 0.4, Ki_yaw   = 0.00, Kd_yaw   = 0.1;
+
+
+// Calibration & State Variables
+float pitchTare = 0.0, yawTare = 0.0;
+float pitchAngle = 0.0, yawAngle = 0.0;
+float filteredPitch = 0.0, filteredYaw = 0.0;
+
+
+float pitchErrorSum = 0.0, lastPitchError = 0.0;
+float yawErrorSum   = 0.0, lastYawError   = 0.0;
+
+
+float currentPitchCmd = PITCH_CENTER;
+float currentYawCmd   = YAW_CENTER;
+
+
+// Timer and Launch Flags
+bool launched = false;
+bool chuteDeployed = false;
+unsigned long launchTime = 0;
+unsigned long lastTime = 0;
+unsigned long lastPrintTime = 0;
+
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PCB_LED_PIN, OUTPUT);
+  pinMode(TEENSY_LED_PIN, OUTPUT);
+
+
+  digitalWrite(TEENSY_LED_PIN, HIGH);
+  digitalWrite(PCB_LED_PIN, LOW);
+
+
+  servoPitch.attach(SERVO_PITCH_PIN);
+  servoYaw.attach(SERVO_YAW_PIN);
+  servoChute.attach(SERVO_CHUTE_PIN);
+
+
+  servoPitch.write(PITCH_CENTER);
+  servoYaw.write(YAW_CENTER);
+  servoChute.write(CHUTE_CLOSED_POS);
+
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+
+  mpu.begin();
+  mpu.calcGyroOffsets(true);
+
+
+  // Auto-Tare Calibration Loop (Referenced to vertical Y-axis)
+  float rawPitchSum = 0.0, rawYawSum = 0.0;
+  for (int i = 0; i < 50; i++) {
+    mpu.update();
+    float ax = mpu.getAccX();
+    float ay = mpu.getAccY();
+    float az = mpu.getAccZ();
+
+
+    rawPitchSum += atan2(ax, ay) * 57.2958; // Left/Right tilt in photo
+    rawYawSum   += atan2(az, ay) * 57.2958; // Front/Back tilt relative to photo
+    delay(10);
+  }
+  pitchTare = rawPitchSum / 50.0;
+  yawTare   = rawYawSum / 50.0;
+
+
+  digitalWrite(PCB_LED_PIN, HIGH);
+  lastTime = micros();
+}
+
+
+void loop() {
+  mpu.update();
+
+
+  unsigned long currentTime = micros();
+  if (currentTime - lastTime < 10000) return; // Fixed 100 Hz Loop
+
+
+  float dt = (currentTime - lastTime) / 1000000.0;
+  lastTime = currentTime;
+
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+
+  float accelMagnitude = sqrt((ax * ax) + (ay * ay) + (az * az));
+
+
+  // Trigonometric tilt referenced to vertical Y-axis
+  float rawPitch = (atan2(ax, ay) * 57.2958) - pitchTare;
+  float rawYaw   = (atan2(az, ay) * 57.2958) - yawTare;
+
+
+  // Complementary Filter:
+  // - Left/Right tilt (Pitch) rotates around Z-axis -> GyroZ
+  // - Front/Back tilt (Yaw) rotates around X-axis -> GyroX
+  pitchAngle = 0.95 * (pitchAngle + mpu.getGyroZ() * dt) + 0.05 * rawPitch;
+  yawAngle   = 0.95 * (yawAngle   + mpu.getGyroX() * dt) + 0.05 * rawYaw;
+
+
+  filteredPitch = (EMA_ALPHA * pitchAngle) + ((1.0 - EMA_ALPHA) * filteredPitch);
+  filteredYaw   = (EMA_ALPHA * yawAngle)   + ((1.0 - EMA_ALPHA) * filteredYaw);
+
+
+  // ==========================================
+  // LAUNCH DETECTION & 10-SECOND TIMER
+  // ==========================================
+  if (!launched && accelMagnitude > LAUNCH_ACCEL_THRESHOLD) {
+    launched = true;
+    launchTime = millis();
+    Serial.println(">>> LAUNCH DETECTED <<<");
+  }
+
+
+  if (launched && !chuteDeployed) {
+    if (millis() - launchTime >= 10000) { // 10 seconds post-launch
+      chuteDeployed = true;
+      servoChute.write(CHUTE_DEPLOY_POS);
+      Serial.println(">>> 10 SECONDS ELAPSED: CHUTE DEPLOYED <<<");
+    }
+  }
+
+
+  // ==========================================
+  // CORRECTED PID CONTROL LOOP
+  // ==========================================
+  // Pitch Servo (Pin 2): Controlled by Left/Right tilt in photo (ax/ay + GyroZ)
+  float pitchError = 0.0 - filteredPitch;
+  pitchErrorSum = constrain(pitchErrorSum + (pitchError * dt), -10.0, 10.0);
+  float pitchDerivative = (pitchError - lastPitchError) / dt;
+  lastPitchError = pitchError;
+  float pitchOutput = (Kp_pitch * pitchError) + (Ki_pitch * pitchErrorSum) + (Kd_pitch * pitchDerivative);
+
+
+  // Yaw Servo (Pin 3): Controlled by Front/Back tilt relative to photo (az/ay + GyroX)
+  float yawError = 0.0 - filteredYaw;
+  yawErrorSum = constrain(yawErrorSum + (yawError * dt), -10.0, 10.0);
+  float yawDerivative = (yawError - lastYawError) / dt;
+  lastYawError = yawError;
+  float yawOutput = (Kp_yaw * yawError) + (Ki_yaw * yawErrorSum) + (Kd_yaw * yawDerivative);
+
+
+  // Target Output Clamping
+  float targetPitchCmd = constrain(PITCH_CENTER - pitchOutput, PITCH_CENTER - PITCH_MAX_DEFLECTION, PITCH_CENTER + PITCH_MAX_DEFLECTION);
+  float targetYawCmd   = constrain(YAW_CENTER   - yawOutput,   YAW_CENTER   - YAW_MAX_DEFLECTION,   YAW_CENTER   + YAW_MAX_DEFLECTION);
+
+
+  // Slew Limiting
+  currentPitchCmd += constrain(targetPitchCmd - currentPitchCmd, -MAX_SERVO_STEP, MAX_SERVO_STEP);
+  currentYawCmd   += constrain(targetYawCmd   - currentYawCmd,   -MAX_SERVO_STEP, MAX_SERVO_STEP);
+
+
+  servoPitch.write(currentPitchCmd);
+  servoYaw.write(currentYawCmd);
+
+
+  // Serial Monitoring Output (Every 200ms)
+  if (millis() - lastPrintTime > 200) {
+    lastPrintTime = millis();
+    Serial.print("Launched: "); Serial.print(launched ? "YES" : "NO");
+    Serial.print(" | Chute: "); Serial.print(chuteDeployed ? "DEPLOYED" : "CLOSED");
+    Serial.print(" | Pitch: "); Serial.print(filteredPitch, 1);
+    Serial.print("° | Yaw: "); Serial.print(filteredYaw, 1);
+    Serial.print("° | Accel G: "); Serial.println(accelMagnitude, 2);
+  }
+}
+
